@@ -1,5 +1,5 @@
 {
-  "name": "http-trigger",
+  "name": "@codeinkit/http-trigger",
   "version": "1.0.0",
   "description": "A basic TypeScript project",
   "main": "dist/index.js",
