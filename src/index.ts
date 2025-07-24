@@ -151,6 +151,8 @@ class HttpTrigger {
         const url = new URL(req.url || '', `http://${req.headers.host}`);
         const filePath = path.join(this.staticPath, url.pathname);
         
+        log(`serving static file ${req.url} from ${filePath}`);
+
         // Security check: prevent directory traversal
         const resolvedPath = path.resolve(filePath);
         const staticDir = path.resolve(this.staticPath);
@@ -163,6 +165,7 @@ class HttpTrigger {
 
         try {
             const stats = fs.statSync(filePath);
+            log(`${stats.isDirectory() ? 'directory' : 'file'} ${filePath}`);
             
             if (stats.isDirectory()) {
                 // Try to serve index.html from directory
