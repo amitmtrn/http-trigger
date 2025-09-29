@@ -29,7 +29,9 @@ interface RouteMatch {
 class HttpTrigger {
 
     private flows: Flows;
-    private routes: { [key: string]: string } = {};
+    private routes: { [key: string]: string } = {
+        'not-found': 'not-found'
+    };
     private corsOptions: CorsOptions;
     private staticPath?: string;
     private unsafe: any;
@@ -258,17 +260,17 @@ class HttpTrigger {
             const url = new URL(req.url || '', `http://${req.headers.host}`);
             const match = this.findMatchingRoute(req.method || 'GET', url.pathname);
 
-            if (!match) {
+            if (!match && req.method === 'GET') {
                 req.url = '/index.html';
                 this.serveStaticFile(req, res);
                 return;
             }
 
-            const { route, params } = match;
+            const { route, params } = match || { route: 'not-found', params: {} };
 
             const query = Object.fromEntries(url.searchParams);
 
-            const result = await this.flows.execute(this.routes[route] || 'not-found', { params, query, headers: req.headers }, {...this.unsafe, req, res}).catch((err: HttpError) => {
+            const result = await this.flows.execute(this.routes[route], { params, query, headers: req.headers }, {...this.unsafe, req, res}).catch((err: HttpError) => {
                 log(err);
                 return {
                     status: err.status || 500,
