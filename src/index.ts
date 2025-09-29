@@ -268,7 +268,7 @@ class HttpTrigger {
 
             const query = Object.fromEntries(url.searchParams);
 
-            const result = await this.flows.execute(this.routes[route], { params, query, headers: req.headers }, {...this.unsafe, req, res}).catch((err: HttpError) => {
+            const result = await this.flows.execute(this.routes[route] || 'not-found', { params, query, headers: req.headers }, {...this.unsafe, req, res}).catch((err: HttpError) => {
                 log(err);
                 return {
                     status: err.status || 500,
