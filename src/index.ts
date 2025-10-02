@@ -8,11 +8,6 @@ const log = debug('http-trigger');
 
 type Flows = any;
 
-interface HttpError {
-    status?: number;
-    description?: string;
-}
-
 interface CorsOptions {
     origin?: string | string[] | boolean;
     methods?: string[];
@@ -350,4 +345,18 @@ export function handleUrlEncodedExtended(data: {}, unsafe: {req: http.IncomingMe
             }
         });
     });
+}
+
+export class HttpError extends Error {
+    public status?: number;
+    public description?: string;
+    
+    constructor(status: number, description?: string) {
+        super(description);
+        this.status = status;
+        this.description = description;
+        if (!description) {
+            this.description = http.STATUS_CODES[status];
+        }
+    }
 }
