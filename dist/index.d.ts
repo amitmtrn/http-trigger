@@ -33,4 +33,9 @@ export declare function handleUrlEncodedExtended(data: {}, unsafe: {
     req: http.IncomingMessage;
     res: http.ServerResponse;
 }): Promise<unknown>;
+export declare class HttpError extends Error {
+    status?: number;
+    description?: string;
+    constructor(status: number, description?: string);
+}
 //# sourceMappingURL=index.d.ts.map

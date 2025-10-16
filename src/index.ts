@@ -141,7 +141,7 @@ class HttpTrigger {
     }
 
     private serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-        if (!this.staticPath || req.method !== 'GET') {
+        if (!this.staticPath || req.method !== 'GET' || req.url?.startsWith('/api/')) {
             return false;
         }
 

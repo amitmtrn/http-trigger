@@ -36,6 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.HttpError = void 0;
 exports.handleJson = handleJson;
 exports.handleUrlEncodedExtended = handleUrlEncodedExtended;
 const fs_1 = __importDefault(require("fs"));
@@ -139,7 +140,7 @@ class HttpTrigger {
         }
     }
     serveStaticFile(req, res) {
-        if (!this.staticPath || req.method !== 'GET') {
+        if (!this.staticPath || req.method !== 'GET' || req.url?.startsWith('/api/')) {
             return false;
         }
         const url = new URL(req.url || '', `http://${req.headers.host}`);
@@ -313,4 +314,17 @@ function handleUrlEncodedExtended(data, unsafe) {
         });
     });
 }
+class HttpError extends Error {
+    status;
+    description;
+    constructor(status, description) {
+        super(description);
+        this.status = status;
+        this.description = description;
+        if (!description) {
+            this.description = http_1.default.STATUS_CODES[status];
+        }
+    }
+}
+exports.HttpError = HttpError;
 //# sourceMappingURL=index.js.map
