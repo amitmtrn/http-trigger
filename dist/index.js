@@ -45,15 +45,24 @@ const http_1 = __importDefault(require("http"));
 const qs_1 = __importDefault(require("qs"));
 const debug_1 = __importDefault(require("debug"));
 const log = (0, debug_1.default)('http-trigger');
+const DEFAULT_SECURITY_HEADERS = {
+    hsts: 'max-age=63072000; includeSubDomains; preload',
+    contentTypeOptions: true,
+    frameOptions: 'DENY',
+    referrerPolicy: 'strict-origin-when-cross-origin',
+    permissionsPolicy: 'camera=(), microphone=(), geolocation=()',
+    contentSecurityPolicy: false
+};
 class HttpTrigger {
     flows;
     routes = {
         'not-found': 'not-found'
     };
     corsOptions;
+    securityHeaders;
     staticPath;
     unsafe;
-    constructor(flows, unsafe, corsOptions, staticPath) {
+    constructor(flows, unsafe, corsOptions, staticPath, securityHeaders) {
         this.flows = flows;
         this.unsafe = unsafe;
         this.staticPath = staticPath;
@@ -65,6 +74,9 @@ class HttpTrigger {
             maxAge: 86400,
             ...corsOptions
         };
+        this.securityHeaders = securityHeaders === false
+            ? false
+            : { ...DEFAULT_SECURITY_HEADERS, ...(typeof securityHeaders === 'object' ? securityHeaders : {}) };
     }
     parseRoutePattern(pattern) {
         const regexPattern = pattern
@@ -137,6 +149,30 @@ class HttpTrigger {
         }
         if (this.corsOptions.maxAge) {
             res.setHeader('Access-Control-Max-Age', this.corsOptions.maxAge.toString());
+        }
+    }
+    setSecurityHeaders(res) {
+        if (this.securityHeaders === false) {
+            return;
+        }
+        const { hsts, contentTypeOptions, frameOptions, referrerPolicy, permissionsPolicy, contentSecurityPolicy } = this.securityHeaders;
+        if (hsts) {
+            res.setHeader('Strict-Transport-Security', hsts);
+        }
+        if (contentTypeOptions) {
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+        }
+        if (frameOptions) {
+            res.setHeader('X-Frame-Options', frameOptions);
+        }
+        if (referrerPolicy) {
+            res.setHeader('Referrer-Policy', referrerPolicy);
+        }
+        if (permissionsPolicy) {
+            res.setHeader('Permissions-Policy', permissionsPolicy);
+        }
+        if (contentSecurityPolicy) {
+            res.setHeader('Content-Security-Policy', contentSecurityPolicy);
         }
     }
     serveStaticFile(req, res) {
@@ -224,6 +260,7 @@ class HttpTrigger {
     listen(port) {
         http_1.default.createServer(async (req, res) => {
             log(`${req.method} ${req.url}`);
+            this.setSecurityHeaders(res);
             const corsHandled = this.handleCors(req, res);
             if (corsHandled) {
                 return;

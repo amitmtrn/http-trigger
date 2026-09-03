@@ -16,6 +16,24 @@ interface CorsOptions {
     maxAge?: number;
 }
 
+interface SecurityHeadersConfig {
+    hsts?: string | false;
+    contentTypeOptions?: boolean;
+    frameOptions?: string | false;
+    referrerPolicy?: string | false;
+    permissionsPolicy?: string | false;
+    contentSecurityPolicy?: string | false;
+}
+
+const DEFAULT_SECURITY_HEADERS: SecurityHeadersConfig = {
+    hsts: 'max-age=63072000; includeSubDomains; preload',
+    contentTypeOptions: true,
+    frameOptions: 'DENY',
+    referrerPolicy: 'strict-origin-when-cross-origin',
+    permissionsPolicy: 'camera=(), microphone=(), geolocation=()',
+    contentSecurityPolicy: false
+};
+
 interface RouteMatch {
     route: string;
     params: { [key: string]: string };
@@ -28,10 +46,11 @@ class HttpTrigger {
         'not-found': 'not-found'
     };
     private corsOptions: CorsOptions;
+    private securityHeaders: SecurityHeadersConfig | false;
     private staticPath?: string;
     private unsafe: any;
-    
-    constructor(flows: Flows, unsafe: any, corsOptions?: CorsOptions, staticPath?: string) {
+
+    constructor(flows: Flows, unsafe: any, corsOptions?: CorsOptions, staticPath?: string, securityHeaders?: boolean | Partial<SecurityHeadersConfig>) {
         this.flows = flows;
         this.unsafe = unsafe;
         this.staticPath = staticPath;
@@ -43,6 +62,9 @@ class HttpTrigger {
             maxAge: 86400, // 24 hours
             ...corsOptions
         };
+        this.securityHeaders = securityHeaders === false
+            ? false
+            : { ...DEFAULT_SECURITY_HEADERS, ...(typeof securityHeaders === 'object' ? securityHeaders : {}) };
     }
 
     private parseRoutePattern(pattern: string): RegExp {
@@ -137,6 +159,33 @@ class HttpTrigger {
         
         if (this.corsOptions.maxAge) {
             res.setHeader('Access-Control-Max-Age', this.corsOptions.maxAge.toString());
+        }
+    }
+
+    private setSecurityHeaders(res: http.ServerResponse) {
+        if (this.securityHeaders === false) {
+            return;
+        }
+
+        const { hsts, contentTypeOptions, frameOptions, referrerPolicy, permissionsPolicy, contentSecurityPolicy } = this.securityHeaders;
+
+        if (hsts) {
+            res.setHeader('Strict-Transport-Security', hsts);
+        }
+        if (contentTypeOptions) {
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+        }
+        if (frameOptions) {
+            res.setHeader('X-Frame-Options', frameOptions);
+        }
+        if (referrerPolicy) {
+            res.setHeader('Referrer-Policy', referrerPolicy);
+        }
+        if (permissionsPolicy) {
+            res.setHeader('Permissions-Policy', permissionsPolicy);
+        }
+        if (contentSecurityPolicy) {
+            res.setHeader('Content-Security-Policy', contentSecurityPolicy);
         }
     }
 
@@ -241,6 +290,7 @@ class HttpTrigger {
     listen(port: number) {
         http.createServer(async (req, res) => {
             log(`${req.method} ${req.url}`);
+            this.setSecurityHeaders(res);
             const corsHandled = this.handleCors(req, res);
             if (corsHandled) {
                 return;
