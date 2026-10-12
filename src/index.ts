@@ -1,412 +1,212 @@
+/**
+ * @codeinkit/http-trigger — turns HTTP requests into flow executions.
+ *
+ * A flow file opts in by exporting a trigger:
+ *   export const triggers = [{ type: 'http', method: 'POST', path: 'stories/:id' }];
+ * `registerFolder` scans a folder for those and maps `POST /api/stories/:id` to the flow named
+ * by the file's path relative to the folder (the same name `flows.registerFolder` gives it).
+ *
+ * The flow receives `{ params, query, headers }` as data and `{ ...unsafe, req, res }` as its
+ * context, and returns `{ status?, response?, headers?, redirect?, httpSent? }`.
+ */
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
-import qs from 'qs';
 import debug from 'debug';
+import { Router } from './router';
+import { applyCors, applySecurityHeaders, CorsOptions, DEFAULT_CORS, DEFAULT_SECURITY_HEADERS, SecurityHeaders } from './headers';
+import { serveStatic } from './static';
+import { HttpError } from './errors';
+
+export { HttpError } from './errors';
+export { handleJson, handleUrlEncodedExtended, readBody } from './body';
+export type { CorsOptions, SecurityHeaders } from './headers';
 
 const log = debug('http-trigger');
 
-type Flows = any;
-
-interface CorsOptions {
-    origin?: string | string[] | boolean;
-    methods?: string[];
-    allowedHeaders?: string[];
-    credentials?: boolean;
-    maxAge?: number;
+interface FlowsLike {
+    execute(flowName: string, input: unknown, unsafe?: unknown): Promise<unknown>;
 }
 
-interface SecurityHeadersConfig {
-    hsts?: string | false;
-    contentTypeOptions?: boolean;
-    frameOptions?: string | false;
-    referrerPolicy?: string | false;
-    permissionsPolicy?: string | false;
-    contentSecurityPolicy?: string | false;
+/** Runs before routing. Return true when the request was fully handled. */
+export type RequestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => boolean | Promise<boolean>;
+
+export interface HttpTriggerOptions {
+    /** CORS headers; `false` sends none. Default allows `*`. */
+    cors?: CorsOptions | false;
+    /** Security headers; `false` sends none. Defaults are strict (HSTS, nosniff, DENY framing). */
+    securityHeaders?: SecurityHeaders | false;
+    /** Folder served for GET requests outside the API prefix; unknown paths fall back to its index.html (SPA). */
+    staticPath?: string;
+    /** Path prefix for routes. Default `/api`. */
+    apiPrefix?: string;
+    /** Handlers tried before static files and routes, in order (health probes, proxies, well-known files). */
+    handlers?: RequestHandler[];
+    /** Flow executed when no route matches under the API prefix. Default `not-found`. */
+    notFoundFlow?: string;
 }
 
-const DEFAULT_SECURITY_HEADERS: SecurityHeadersConfig = {
-    hsts: 'max-age=63072000; includeSubDomains; preload',
-    contentTypeOptions: true,
-    frameOptions: 'DENY',
-    referrerPolicy: 'strict-origin-when-cross-origin',
-    permissionsPolicy: 'camera=(), microphone=(), geolocation=()',
-    contentSecurityPolicy: false
-};
-
-interface RouteMatch {
-    route: string;
-    params: { [key: string]: string };
+export interface HttpTriggerDeclaration {
+    type: 'http';
+    method?: string;
+    path?: string;
 }
 
-class HttpTrigger {
+export interface FlowResult {
+    status?: number;
+    response?: unknown;
+    headers?: Record<string, string>;
+    redirect?: string;
+    httpSent?: boolean;
+}
 
-    private flows: Flows;
-    private routes: { [key: string]: string } = {
-        'not-found': 'not-found'
-    };
-    private corsOptions: CorsOptions;
-    private securityHeaders: SecurityHeadersConfig | false;
-    private staticPath?: string;
-    private unsafe: any;
+function isLegacyCors(value: unknown): value is CorsOptions {
+    return !!value && typeof value === 'object' && ['origin', 'methods', 'allowedHeaders', 'credentials', 'maxAge'].some((k) => k in (value as object));
+}
 
-    constructor(flows: Flows, unsafe: any, corsOptions?: CorsOptions, staticPath?: string, securityHeaders?: boolean | Partial<SecurityHeadersConfig>) {
-        this.flows = flows;
-        this.unsafe = unsafe;
-        this.staticPath = staticPath;
-        this.corsOptions = {
-            origin: '*',
-            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-            credentials: false,
-            maxAge: 86400, // 24 hours
-            ...corsOptions
-        };
-        this.securityHeaders = securityHeaders === false
-            ? false
-            : { ...DEFAULT_SECURITY_HEADERS, ...(typeof securityHeaders === 'object' ? securityHeaders : {}) };
+export class HttpTrigger {
+    private readonly router = new Router();
+    private readonly cors: Required<CorsOptions> | false;
+    private readonly security: SecurityHeaders | false;
+    private readonly staticPath?: string;
+    private readonly apiPrefix: string;
+    private readonly handlers: RequestHandler[];
+    private readonly notFoundFlow: string;
+    private server?: http.Server;
+
+    constructor(flows: FlowsLike, unsafe: Record<string, unknown>, options?: HttpTriggerOptions);
+    /** @deprecated positional form kept for 1.x callers: (flows, unsafe, cors, staticPath, securityHeaders) */
+    constructor(flows: FlowsLike, unsafe: Record<string, unknown>, cors?: CorsOptions, staticPath?: string, securityHeaders?: boolean | SecurityHeaders);
+    constructor(
+        private readonly flows: FlowsLike,
+        private readonly unsafe: Record<string, unknown>,
+        third?: HttpTriggerOptions | CorsOptions,
+        legacyStaticPath?: string,
+        legacySecurity?: boolean | SecurityHeaders,
+    ) {
+        const options: HttpTriggerOptions = isLegacyCors(third) || legacyStaticPath !== undefined || legacySecurity !== undefined
+            ? { cors: third as CorsOptions, staticPath: legacyStaticPath, securityHeaders: legacySecurity === false ? false : (typeof legacySecurity === 'object' ? legacySecurity : undefined) }
+            : (third as HttpTriggerOptions) || {};
+        this.cors = options.cors === false ? false : { ...DEFAULT_CORS, ...(options.cors || {}) };
+        this.security = options.securityHeaders === false ? false : { ...DEFAULT_SECURITY_HEADERS, ...(options.securityHeaders || {}) };
+        this.staticPath = options.staticPath;
+        this.apiPrefix = (options.apiPrefix ?? '/api').replace(/\/$/, '');
+        this.handlers = options.handlers || [];
+        this.notFoundFlow = options.notFoundFlow || 'not-found';
     }
 
-    private parseRoutePattern(pattern: string): RegExp {
-        // Convert route pattern like "/api/users/:id/posts/:postId" to regex
-        const regexPattern = pattern
-            .replace(/:[^/]+/g, '([^/]+)') // Replace :param with capture group
-            .replace(/\//g, '\\/'); // Escape forward slashes
-        return new RegExp(`^${regexPattern}$`);
+    /** Map `method` + `path` (relative to the API prefix, with or without a leading slash) to a flow. */
+    register(method: string, routePath: string, flowName: string): void {
+        const full = `${this.apiPrefix}/${routePath.replace(/^\/+/, '')}`;
+        log(`route ${method.toUpperCase()} ${full} -> ${flowName}`);
+        this.router.register(method, full, flowName);
     }
 
-    private extractParams(pattern: string, path: string): { [key: string]: string } {
-        const params: { [key: string]: string } = {};
-        const paramNames = (pattern.match(/:[^/]+/g) || []).map(p => p.slice(1)); // Remove : prefix
-        const regex = this.parseRoutePattern(pattern);
-        const matches = path.match(regex);
-        
-        if (matches) {
-            paramNames.forEach((name, index) => {
-                params[name] = matches[index + 1]; // +1 because first match is the full string
-            });
-        }
-        
-        return params;
-    }
-
-    private findMatchingRoute(method: string, path: string): RouteMatch | null {
-        const routeKey = `${method} ${path}`;
-        
-        // First try exact match
-        if (this.routes[routeKey]) {
-            return { route: routeKey, params: {} };
-        }
-        
-        // Then try pattern matching for routes with parameters
-        for (const [routePattern, _flowName] of Object.entries(this.routes)) {
-            const [routeMethod, routePath] = routePattern.split(' ', 2);
-            
-            if (routeMethod === method) {
-                const regex = this.parseRoutePattern(routePath);
-                if (regex.test(path)) {
-                    const params = this.extractParams(routePath, path);
-                    return { route: routePattern, params };
+    /** Scan `folder` for flow files exporting an http trigger. The flow name is the file path relative to `folder`, without extension. */
+    async registerFolder(folder: string): Promise<void> {
+        const walk = async (dir: string): Promise<void> => {
+            const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            await Promise.all(entries.map(async (entry) => {
+                const filePath = path.join(dir, entry.name);
+                if (entry.isDirectory()) return walk(filePath);
+                if (!/\.(js|ts|mjs|cjs)$/.test(entry.name) || /\.d\.ts$/.test(entry.name)) return;
+                const mod = await import(filePath);
+                const triggers: HttpTriggerDeclaration[] = Array.isArray(mod?.triggers) ? mod.triggers : [];
+                const flowName = path.relative(folder, filePath).replace(/\.[^.]+$/, '').split(path.sep).join('/');
+                for (const t of triggers) {
+                    if (t?.type !== 'http') continue;
+                    this.register(t.method || 'GET', t.path || flowName, flowName);
                 }
+            }));
+        };
+        await walk(folder);
+    }
+
+    routes(): Array<{ method: string; pattern: string; flowName: string }> {
+        return this.router.list();
+    }
+
+    /** The request pipeline: headers → custom handlers → static → route → flow → response. */
+    async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        log(`${req.method} ${req.url}`);
+        if (this.security) applySecurityHeaders(res, this.security);
+        if (this.cors) {
+            applyCors(res, this.cors, req.headers.origin);
+            if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+        }
+        for (const handler of this.handlers) {
+            if (await handler(req, res)) return;
+        }
+
+        const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+        const isApi = url.pathname === this.apiPrefix || url.pathname.startsWith(this.apiPrefix + '/');
+        const isRead = req.method === 'GET' || req.method === 'HEAD';
+
+        if (this.staticPath && isRead && !isApi) {
+            if (await serveStatic(this.staticPath, url.pathname, req, res)) return;
+        }
+
+        const match = this.router.match(req.method || 'GET', url.pathname);
+        if (!match) {
+            if (this.staticPath && isRead && !isApi) {
+                if (await serveStatic(this.staticPath, '/index.html', req, res)) return;
             }
-        }
-        
-        return null;
-    }
-
-    private handleCors(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-        const origin = req.headers.origin;
-        
-        // Handle preflight requests
-        if (req.method === 'OPTIONS') {
-            this.setCorsHeaders(res, origin);
-            res.writeHead(204);
-            res.end();
-            return true;
-        }
-        
-        // Set CORS headers for actual requests
-        this.setCorsHeaders(res, origin);
-        return false;
-    }
-
-    private setCorsHeaders(res: http.ServerResponse, origin?: string) {
-        // Handle origin
-        if (this.corsOptions.origin === true) {
-            res.setHeader('Access-Control-Allow-Origin', origin || '*');
-        } else if (this.corsOptions.origin === false) {
-            // Don't set origin header
-        } else if (Array.isArray(this.corsOptions.origin)) {
-            if (origin && this.corsOptions.origin.includes(origin)) {
-                res.setHeader('Access-Control-Allow-Origin', origin);
-            }
-        } else {
-            res.setHeader('Access-Control-Allow-Origin', this.corsOptions.origin || '*');
-        }
-
-        // Set other CORS headers
-        if (this.corsOptions.methods) {
-            res.setHeader('Access-Control-Allow-Methods', this.corsOptions.methods.join(', '));
-        }
-        
-        if (this.corsOptions.allowedHeaders) {
-            res.setHeader('Access-Control-Allow-Headers', this.corsOptions.allowedHeaders.join(', '));
-        }
-        
-        if (this.corsOptions.credentials) {
-            res.setHeader('Access-Control-Allow-Credentials', 'true');
-        }
-        
-        if (this.corsOptions.maxAge) {
-            res.setHeader('Access-Control-Max-Age', this.corsOptions.maxAge.toString());
-        }
-    }
-
-    private setSecurityHeaders(res: http.ServerResponse) {
-        if (this.securityHeaders === false) {
+            await this.runFlow(this.notFoundFlow, {}, url, req, res);
             return;
         }
-
-        const { hsts, contentTypeOptions, frameOptions, referrerPolicy, permissionsPolicy, contentSecurityPolicy } = this.securityHeaders;
-
-        if (hsts) {
-            res.setHeader('Strict-Transport-Security', hsts);
-        }
-        if (contentTypeOptions) {
-            res.setHeader('X-Content-Type-Options', 'nosniff');
-        }
-        if (frameOptions) {
-            res.setHeader('X-Frame-Options', frameOptions);
-        }
-        if (referrerPolicy) {
-            res.setHeader('Referrer-Policy', referrerPolicy);
-        }
-        if (permissionsPolicy) {
-            res.setHeader('Permissions-Policy', permissionsPolicy);
-        }
-        if (contentSecurityPolicy) {
-            res.setHeader('Content-Security-Policy', contentSecurityPolicy);
-        }
+        await this.runFlow(match.flowName, match.params, url, req, res);
     }
 
-    private serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-        if (!this.staticPath || req.method !== 'GET' || req.url?.startsWith('/api/')) {
-            return false;
-        }
-
-        const url = new URL(req.url || '', `http://${req.headers.host}`);
-        const filePath = path.join(this.staticPath, url.pathname);
-        
-        log(`serving static file ${req.url} from ${filePath}`);
-
-        // Security check: prevent directory traversal
-        const resolvedPath = path.resolve(filePath);
-        const staticDir = path.resolve(this.staticPath);
-        
-        if (!resolvedPath.startsWith(staticDir)) {
-            res.statusCode = 403;
-            res.end('Forbidden');
-            return true;
-        }
-
-        try {
-            const stats = fs.statSync(filePath);
-            log(`${stats.isDirectory() ? 'directory' : 'file'} ${filePath}`);
-            
-            if (stats.isDirectory()) {
-                // Try to serve index.html from directory
-                const indexPath = path.join(filePath, 'index.html');
-                if (fs.existsSync(indexPath)) {
-                    res.setHeader('Content-Type', 'text/html');
-                    res.writeHead(200);
-                    fs.createReadStream(indexPath).pipe(res);
-                    return true;
-                }
-                return false;
-            }
-
-            if (stats.isFile()) {
-                const ext = path.extname(filePath).toLowerCase();
-                
-                // Set appropriate Content-Type based on file extension
-                const mimeTypes: { [key: string]: string } = {
-                    '.html': 'text/html',
-                    '.css': 'text/css',
-                    '.js': 'application/javascript',
-                    '.json': 'application/json',
-                    '.png': 'image/png',
-                    '.jpg': 'image/jpeg',
-                    '.jpeg': 'image/jpeg',
-                    '.gif': 'image/gif',
-                    '.svg': 'image/svg+xml',
-                    '.ico': 'image/x-icon',
-                    '.txt': 'text/plain',
-                    '.pdf': 'application/pdf',
-                    '.xml': 'application/xml',
-                    '.woff': 'font/woff',
-                    '.woff2': 'font/woff2',
-                    '.ttf': 'font/ttf',
-                    '.eot': 'application/vnd.ms-fontobject'
-                };
-
-                const contentType = mimeTypes[ext] || 'application/octet-stream';
-                res.setHeader('Content-Type', contentType);
-                res.writeHead(200);
-                fs.createReadStream(filePath).pipe(res);
-                return true;
-            }
-        } catch (error) {
-            // File doesn't exist or other error
-            return false;
-        }
-
-        return false;
+    private async runFlow(flowName: string, params: Record<string, string>, url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        const query = Object.fromEntries(url.searchParams);
+        const result = await this.flows
+            .execute(flowName, { params, query, headers: req.headers }, { ...this.unsafe, req, res })
+            .catch((err: unknown) => this.resultFromError(err)) as FlowResult | undefined;
+        this.send(res, result || {});
     }
 
-    async registerFolder(folder:string) {
-        await this._registerFolder(folder, folder);
-    }
-    private async _registerFolder(folder: string, originalFolder: string) {
-        const files = await fs.promises.readdir(folder);
-
-        await Promise.all(files.map(async file => {
-          const filePath = path.join(folder, file);
-          const stats = await fs.promises.stat(filePath);
-    
-          if(stats.isDirectory()) {
-            await this._registerFolder(filePath, originalFolder);
-          } else {
-            const httpTrigger = (await import(filePath))?.triggers?.find((trigger: any) => trigger.type === 'http');
-            if (!httpTrigger) {
-                return;
-            }
-            const relativeFilePath = path.relative(originalFolder, filePath);
-            log(`Registering route ${httpTrigger.method || 'GET'} /api/${httpTrigger.path || relativeFilePath.split('.')[0]}`);
-            this.routes[`${httpTrigger.method || 'GET'} /api/${httpTrigger.path || relativeFilePath.split('.')[0]}`] = relativeFilePath.split('.')[0];
-          }
-        }));
+    private resultFromError(err: unknown): FlowResult {
+        log(err);
+        if (err instanceof HttpError || (typeof err === 'object' && err !== null && 'status' in err)) {
+            const e = err as HttpError;
+            return { status: e.status || 500, response: e.response ?? (e.description || 'Internal server error'), headers: e.headers };
+        }
+        return { status: 500, response: 'Internal server error' };
     }
 
-    listen(port: number) {
-        http.createServer(async (req, res) => {
-            log(`${req.method} ${req.url}`);
-            this.setSecurityHeaders(res);
-            const corsHandled = this.handleCors(req, res);
-            if (corsHandled) {
-                return;
-            }
-
-            // Try to serve static files first
-            const staticServed = this.serveStaticFile(req, res);
-            if (staticServed) {
-                return;
-            }
-
-            const url = new URL(req.url || '', `http://${req.headers.host}`);
-            const match = this.findMatchingRoute(req.method || 'GET', url.pathname);
-
-            if (!match && req.method === 'GET') {
-                req.url = '/index.html';
-                this.serveStaticFile(req, res);
-                return;
-            }
-
-            const { route, params } = match || { route: 'not-found', params: {} };
-
-            const query = Object.fromEntries(url.searchParams);
-
-            const result = await this.flows.execute(this.routes[route], { params, query, headers: req.headers }, {...this.unsafe, req, res}).catch((err: HttpError) => {
-                log(err);
-                return {
-                    status: err.status || 500,
-                    response: err.description || 'Internal server error',
-                    redirect: undefined,
-                    headers: undefined,
-                    httpSent: false
-                }
-            });
-            
-            
-            const { status, response, redirect, headers, httpSent } = result as any;
-            
-            if (httpSent) {
-                return;
-            }
-
-            if (response?.type === 'Buffer') {
-                res.end(Buffer.from(response.data));
-                return;
-            }
-
-            if (redirect) {
-                res.writeHead(302, { Location: redirect });
-                res.end();
-                return;
-            }
-
-            if (headers) {
-                for (const [key, value] of Object.entries(headers)) {
-                    res.setHeader(key, value as string);
-                }
-            }
-    
-            res.setHeader('Content-Type', 'application/json');
+    private send(res: http.ServerResponse, result: FlowResult): void {
+        const { status, response, redirect, headers, httpSent } = result;
+        if (httpSent) return;
+        if (headers) for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+        if (redirect) { res.writeHead(302, { Location: redirect }); res.end(); return; }
+        const r = response as { type?: string; data?: number[] } | undefined;
+        if (r && typeof r === 'object' && r.type === 'Buffer' && Array.isArray(r.data)) {
             res.writeHead(status || 200);
-            res.end(JSON.stringify(response));
-        }).listen(port);
+            res.end(Buffer.from(r.data));
+            return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(status || 200);
+        res.end(JSON.stringify(response ?? null));
+    }
+
+    listen(port: number, callback?: () => void): http.Server {
+        this.server = http.createServer((req, res) => {
+            this.handle(req, res).catch((err) => {
+                log('unhandled', err);
+                if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'application/json' }); }
+                res.end(JSON.stringify('Internal server error'));
+            });
+        });
+        return this.server.listen(port, callback);
+    }
+
+    close(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (!this.server || !this.server.listening) return resolve();
+            this.server.close((err) => (err ? reject(err) : resolve()));
+        });
     }
 }
 
 export default HttpTrigger;
-
-export function handleJson(data: {}, unsafe: {req: http.IncomingMessage, res: http.ServerResponse}) {
-    return new Promise((resolve, reject) => {
-        let body = '';
-        unsafe.req.on('data', chunk => {
-            body += chunk.toString();
-        });
-        unsafe.req.on('end', () => {
-            try {
-                resolve({
-                    ...data,
-                    body: body ? JSON.parse(body) : {}
-                });
-            } catch (error) {
-                reject(error);
-            }
-        });
-    });
-}
-
-export function handleUrlEncodedExtended(data: {}, unsafe: {req: http.IncomingMessage, res: http.ServerResponse}) {
-    return new Promise((resolve, reject) => {
-        let body = '';
-        unsafe.req.on('data', chunk => {
-            body += chunk.toString();
-        });
-        unsafe.req.on('end', () => {
-            try {
-                resolve({
-                    ...data,
-                    body: body ? qs.parse(body) : {}
-                });
-            } catch (error) {
-                reject(error);
-            }
-        });
-    });
-}
-
-export class HttpError extends Error {
-    public status?: number;
-    public description?: string;
-    
-    constructor(status: number, description?: string) {
-        super(description);
-        this.status = status;
-        this.description = description;
-        if (!description) {
-            this.description = http.STATUS_CODES[status];
-        }
-    }
-}

@@ -1,51 +1,58 @@
 import http from 'http';
-type Flows = any;
-interface CorsOptions {
-    origin?: string | string[] | boolean;
-    methods?: string[];
-    allowedHeaders?: string[];
-    credentials?: boolean;
-    maxAge?: number;
+import { CorsOptions, SecurityHeaders } from './headers';
+export { HttpError } from './errors';
+export { handleJson, handleUrlEncodedExtended, readBody } from './body';
+export type { CorsOptions, SecurityHeaders } from './headers';
+interface FlowsLike {
+    execute(flowName: string, input: unknown, unsafe?: unknown): Promise<unknown>;
 }
-interface SecurityHeadersConfig {
-    hsts?: string | false;
-    contentTypeOptions?: boolean;
-    frameOptions?: string | false;
-    referrerPolicy?: string | false;
-    permissionsPolicy?: string | false;
-    contentSecurityPolicy?: string | false;
+export type RequestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => boolean | Promise<boolean>;
+export interface HttpTriggerOptions {
+    cors?: CorsOptions | false;
+    securityHeaders?: SecurityHeaders | false;
+    staticPath?: string;
+    apiPrefix?: string;
+    handlers?: RequestHandler[];
+    notFoundFlow?: string;
 }
-declare class HttpTrigger {
-    private flows;
-    private routes;
-    private corsOptions;
-    private securityHeaders;
-    private staticPath?;
-    private unsafe;
-    constructor(flows: Flows, unsafe: any, corsOptions?: CorsOptions, staticPath?: string, securityHeaders?: boolean | Partial<SecurityHeadersConfig>);
-    private parseRoutePattern;
-    private extractParams;
-    private findMatchingRoute;
-    private handleCors;
-    private setCorsHeaders;
-    private setSecurityHeaders;
-    private serveStaticFile;
+export interface HttpTriggerDeclaration {
+    type: 'http';
+    method?: string;
+    path?: string;
+}
+export interface FlowResult {
+    status?: number;
+    response?: unknown;
+    headers?: Record<string, string>;
+    redirect?: string;
+    httpSent?: boolean;
+}
+export declare class HttpTrigger {
+    private readonly flows;
+    private readonly unsafe;
+    private readonly router;
+    private readonly cors;
+    private readonly security;
+    private readonly staticPath?;
+    private readonly apiPrefix;
+    private readonly handlers;
+    private readonly notFoundFlow;
+    private server?;
+    constructor(flows: FlowsLike, unsafe: Record<string, unknown>, options?: HttpTriggerOptions);
+    constructor(flows: FlowsLike, unsafe: Record<string, unknown>, cors?: CorsOptions, staticPath?: string, securityHeaders?: boolean | SecurityHeaders);
+    register(method: string, routePath: string, flowName: string): void;
     registerFolder(folder: string): Promise<void>;
-    private _registerFolder;
-    listen(port: number): void;
+    routes(): Array<{
+        method: string;
+        pattern: string;
+        flowName: string;
+    }>;
+    handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void>;
+    private runFlow;
+    private resultFromError;
+    private send;
+    listen(port: number, callback?: () => void): http.Server;
+    close(): Promise<void>;
 }
 export default HttpTrigger;
-export declare function handleJson(data: {}, unsafe: {
-    req: http.IncomingMessage;
-    res: http.ServerResponse;
-}): Promise<unknown>;
-export declare function handleUrlEncodedExtended(data: {}, unsafe: {
-    req: http.IncomingMessage;
-    res: http.ServerResponse;
-}): Promise<unknown>;
-export declare class HttpError extends Error {
-    status?: number;
-    description?: string;
-    constructor(status: number, description?: string);
-}
 //# sourceMappingURL=index.d.ts.map

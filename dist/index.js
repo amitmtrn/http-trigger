@@ -36,332 +36,169 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.HttpError = void 0;
-exports.handleJson = handleJson;
-exports.handleUrlEncodedExtended = handleUrlEncodedExtended;
+exports.HttpTrigger = exports.readBody = exports.handleUrlEncodedExtended = exports.handleJson = exports.HttpError = void 0;
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const http_1 = __importDefault(require("http"));
-const qs_1 = __importDefault(require("qs"));
 const debug_1 = __importDefault(require("debug"));
+const router_1 = require("./router");
+const headers_1 = require("./headers");
+const static_1 = require("./static");
+const errors_1 = require("./errors");
+var errors_2 = require("./errors");
+Object.defineProperty(exports, "HttpError", { enumerable: true, get: function () { return errors_2.HttpError; } });
+var body_1 = require("./body");
+Object.defineProperty(exports, "handleJson", { enumerable: true, get: function () { return body_1.handleJson; } });
+Object.defineProperty(exports, "handleUrlEncodedExtended", { enumerable: true, get: function () { return body_1.handleUrlEncodedExtended; } });
+Object.defineProperty(exports, "readBody", { enumerable: true, get: function () { return body_1.readBody; } });
 const log = (0, debug_1.default)('http-trigger');
-const DEFAULT_SECURITY_HEADERS = {
-    hsts: 'max-age=63072000; includeSubDomains; preload',
-    contentTypeOptions: true,
-    frameOptions: 'DENY',
-    referrerPolicy: 'strict-origin-when-cross-origin',
-    permissionsPolicy: 'camera=(), microphone=(), geolocation=()',
-    contentSecurityPolicy: false
-};
+function isLegacyCors(value) {
+    return !!value && typeof value === 'object' && ['origin', 'methods', 'allowedHeaders', 'credentials', 'maxAge'].some((k) => k in value);
+}
 class HttpTrigger {
     flows;
-    routes = {
-        'not-found': 'not-found'
-    };
-    corsOptions;
-    securityHeaders;
-    staticPath;
     unsafe;
-    constructor(flows, unsafe, corsOptions, staticPath, securityHeaders) {
+    router = new router_1.Router();
+    cors;
+    security;
+    staticPath;
+    apiPrefix;
+    handlers;
+    notFoundFlow;
+    server;
+    constructor(flows, unsafe, third, legacyStaticPath, legacySecurity) {
         this.flows = flows;
         this.unsafe = unsafe;
-        this.staticPath = staticPath;
-        this.corsOptions = {
-            origin: '*',
-            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-            credentials: false,
-            maxAge: 86400,
-            ...corsOptions
-        };
-        this.securityHeaders = securityHeaders === false
-            ? false
-            : { ...DEFAULT_SECURITY_HEADERS, ...(typeof securityHeaders === 'object' ? securityHeaders : {}) };
+        const options = isLegacyCors(third) || legacyStaticPath !== undefined || legacySecurity !== undefined
+            ? { cors: third, staticPath: legacyStaticPath, securityHeaders: legacySecurity === false ? false : (typeof legacySecurity === 'object' ? legacySecurity : undefined) }
+            : third || {};
+        this.cors = options.cors === false ? false : { ...headers_1.DEFAULT_CORS, ...(options.cors || {}) };
+        this.security = options.securityHeaders === false ? false : { ...headers_1.DEFAULT_SECURITY_HEADERS, ...(options.securityHeaders || {}) };
+        this.staticPath = options.staticPath;
+        this.apiPrefix = (options.apiPrefix ?? '/api').replace(/\/$/, '');
+        this.handlers = options.handlers || [];
+        this.notFoundFlow = options.notFoundFlow || 'not-found';
     }
-    parseRoutePattern(pattern) {
-        const regexPattern = pattern
-            .replace(/:[^/]+/g, '([^/]+)')
-            .replace(/\//g, '\\/');
-        return new RegExp(`^${regexPattern}$`);
-    }
-    extractParams(pattern, path) {
-        const params = {};
-        const paramNames = (pattern.match(/:[^/]+/g) || []).map(p => p.slice(1));
-        const regex = this.parseRoutePattern(pattern);
-        const matches = path.match(regex);
-        if (matches) {
-            paramNames.forEach((name, index) => {
-                params[name] = matches[index + 1];
-            });
-        }
-        return params;
-    }
-    findMatchingRoute(method, path) {
-        const routeKey = `${method} ${path}`;
-        if (this.routes[routeKey]) {
-            return { route: routeKey, params: {} };
-        }
-        for (const [routePattern, _flowName] of Object.entries(this.routes)) {
-            const [routeMethod, routePath] = routePattern.split(' ', 2);
-            if (routeMethod === method) {
-                const regex = this.parseRoutePattern(routePath);
-                if (regex.test(path)) {
-                    const params = this.extractParams(routePath, path);
-                    return { route: routePattern, params };
-                }
-            }
-        }
-        return null;
-    }
-    handleCors(req, res) {
-        const origin = req.headers.origin;
-        if (req.method === 'OPTIONS') {
-            this.setCorsHeaders(res, origin);
-            res.writeHead(204);
-            res.end();
-            return true;
-        }
-        this.setCorsHeaders(res, origin);
-        return false;
-    }
-    setCorsHeaders(res, origin) {
-        if (this.corsOptions.origin === true) {
-            res.setHeader('Access-Control-Allow-Origin', origin || '*');
-        }
-        else if (this.corsOptions.origin === false) {
-        }
-        else if (Array.isArray(this.corsOptions.origin)) {
-            if (origin && this.corsOptions.origin.includes(origin)) {
-                res.setHeader('Access-Control-Allow-Origin', origin);
-            }
-        }
-        else {
-            res.setHeader('Access-Control-Allow-Origin', this.corsOptions.origin || '*');
-        }
-        if (this.corsOptions.methods) {
-            res.setHeader('Access-Control-Allow-Methods', this.corsOptions.methods.join(', '));
-        }
-        if (this.corsOptions.allowedHeaders) {
-            res.setHeader('Access-Control-Allow-Headers', this.corsOptions.allowedHeaders.join(', '));
-        }
-        if (this.corsOptions.credentials) {
-            res.setHeader('Access-Control-Allow-Credentials', 'true');
-        }
-        if (this.corsOptions.maxAge) {
-            res.setHeader('Access-Control-Max-Age', this.corsOptions.maxAge.toString());
-        }
-    }
-    setSecurityHeaders(res) {
-        if (this.securityHeaders === false) {
-            return;
-        }
-        const { hsts, contentTypeOptions, frameOptions, referrerPolicy, permissionsPolicy, contentSecurityPolicy } = this.securityHeaders;
-        if (hsts) {
-            res.setHeader('Strict-Transport-Security', hsts);
-        }
-        if (contentTypeOptions) {
-            res.setHeader('X-Content-Type-Options', 'nosniff');
-        }
-        if (frameOptions) {
-            res.setHeader('X-Frame-Options', frameOptions);
-        }
-        if (referrerPolicy) {
-            res.setHeader('Referrer-Policy', referrerPolicy);
-        }
-        if (permissionsPolicy) {
-            res.setHeader('Permissions-Policy', permissionsPolicy);
-        }
-        if (contentSecurityPolicy) {
-            res.setHeader('Content-Security-Policy', contentSecurityPolicy);
-        }
-    }
-    serveStaticFile(req, res) {
-        if (!this.staticPath || req.method !== 'GET' || req.url?.startsWith('/api/')) {
-            return false;
-        }
-        const url = new URL(req.url || '', `http://${req.headers.host}`);
-        const filePath = path_1.default.join(this.staticPath, url.pathname);
-        log(`serving static file ${req.url} from ${filePath}`);
-        const resolvedPath = path_1.default.resolve(filePath);
-        const staticDir = path_1.default.resolve(this.staticPath);
-        if (!resolvedPath.startsWith(staticDir)) {
-            res.statusCode = 403;
-            res.end('Forbidden');
-            return true;
-        }
-        try {
-            const stats = fs_1.default.statSync(filePath);
-            log(`${stats.isDirectory() ? 'directory' : 'file'} ${filePath}`);
-            if (stats.isDirectory()) {
-                const indexPath = path_1.default.join(filePath, 'index.html');
-                if (fs_1.default.existsSync(indexPath)) {
-                    res.setHeader('Content-Type', 'text/html');
-                    res.writeHead(200);
-                    fs_1.default.createReadStream(indexPath).pipe(res);
-                    return true;
-                }
-                return false;
-            }
-            if (stats.isFile()) {
-                const ext = path_1.default.extname(filePath).toLowerCase();
-                const mimeTypes = {
-                    '.html': 'text/html',
-                    '.css': 'text/css',
-                    '.js': 'application/javascript',
-                    '.json': 'application/json',
-                    '.png': 'image/png',
-                    '.jpg': 'image/jpeg',
-                    '.jpeg': 'image/jpeg',
-                    '.gif': 'image/gif',
-                    '.svg': 'image/svg+xml',
-                    '.ico': 'image/x-icon',
-                    '.txt': 'text/plain',
-                    '.pdf': 'application/pdf',
-                    '.xml': 'application/xml',
-                    '.woff': 'font/woff',
-                    '.woff2': 'font/woff2',
-                    '.ttf': 'font/ttf',
-                    '.eot': 'application/vnd.ms-fontobject'
-                };
-                const contentType = mimeTypes[ext] || 'application/octet-stream';
-                res.setHeader('Content-Type', contentType);
-                res.writeHead(200);
-                fs_1.default.createReadStream(filePath).pipe(res);
-                return true;
-            }
-        }
-        catch (error) {
-            return false;
-        }
-        return false;
+    register(method, routePath, flowName) {
+        const full = `${this.apiPrefix}/${routePath.replace(/^\/+/, '')}`;
+        log(`route ${method.toUpperCase()} ${full} -> ${flowName}`);
+        this.router.register(method, full, flowName);
     }
     async registerFolder(folder) {
-        await this._registerFolder(folder, folder);
-    }
-    async _registerFolder(folder, originalFolder) {
-        const files = await fs_1.default.promises.readdir(folder);
-        await Promise.all(files.map(async (file) => {
-            const filePath = path_1.default.join(folder, file);
-            const stats = await fs_1.default.promises.stat(filePath);
-            if (stats.isDirectory()) {
-                await this._registerFolder(filePath, originalFolder);
-            }
-            else {
-                const httpTrigger = (await Promise.resolve(`${filePath}`).then(s => __importStar(require(s))))?.triggers?.find((trigger) => trigger.type === 'http');
-                if (!httpTrigger) {
+        const walk = async (dir) => {
+            const entries = await fs_1.default.promises.readdir(dir, { withFileTypes: true });
+            await Promise.all(entries.map(async (entry) => {
+                const filePath = path_1.default.join(dir, entry.name);
+                if (entry.isDirectory())
+                    return walk(filePath);
+                if (!/\.(js|ts|mjs|cjs)$/.test(entry.name) || /\.d\.ts$/.test(entry.name))
                     return;
+                const mod = await Promise.resolve(`${filePath}`).then(s => __importStar(require(s)));
+                const triggers = Array.isArray(mod?.triggers) ? mod.triggers : [];
+                const flowName = path_1.default.relative(folder, filePath).replace(/\.[^.]+$/, '').split(path_1.default.sep).join('/');
+                for (const t of triggers) {
+                    if (t?.type !== 'http')
+                        continue;
+                    this.register(t.method || 'GET', t.path || flowName, flowName);
                 }
-                const relativeFilePath = path_1.default.relative(originalFolder, filePath);
-                log(`Registering route ${httpTrigger.method || 'GET'} /api/${httpTrigger.path || relativeFilePath.split('.')[0]}`);
-                this.routes[`${httpTrigger.method || 'GET'} /api/${httpTrigger.path || relativeFilePath.split('.')[0]}`] = relativeFilePath.split('.')[0];
-            }
-        }));
+            }));
+        };
+        await walk(folder);
     }
-    listen(port) {
-        http_1.default.createServer(async (req, res) => {
-            log(`${req.method} ${req.url}`);
-            this.setSecurityHeaders(res);
-            const corsHandled = this.handleCors(req, res);
-            if (corsHandled) {
-                return;
-            }
-            const staticServed = this.serveStaticFile(req, res);
-            if (staticServed) {
-                return;
-            }
-            const url = new URL(req.url || '', `http://${req.headers.host}`);
-            const match = this.findMatchingRoute(req.method || 'GET', url.pathname);
-            if (!match && req.method === 'GET') {
-                req.url = '/index.html';
-                this.serveStaticFile(req, res);
-                return;
-            }
-            const { route, params } = match || { route: 'not-found', params: {} };
-            const query = Object.fromEntries(url.searchParams);
-            const result = await this.flows.execute(this.routes[route], { params, query, headers: req.headers }, { ...this.unsafe, req, res }).catch((err) => {
-                log(err);
-                return {
-                    status: err.status || 500,
-                    response: err.description || 'Internal server error',
-                    redirect: undefined,
-                    headers: undefined,
-                    httpSent: false
-                };
-            });
-            const { status, response, redirect, headers, httpSent } = result;
-            if (httpSent) {
-                return;
-            }
-            if (response?.type === 'Buffer') {
-                res.end(Buffer.from(response.data));
-                return;
-            }
-            if (redirect) {
-                res.writeHead(302, { Location: redirect });
+    routes() {
+        return this.router.list();
+    }
+    async handle(req, res) {
+        log(`${req.method} ${req.url}`);
+        if (this.security)
+            (0, headers_1.applySecurityHeaders)(res, this.security);
+        if (this.cors) {
+            (0, headers_1.applyCors)(res, this.cors, req.headers.origin);
+            if (req.method === 'OPTIONS') {
+                res.writeHead(204);
                 res.end();
                 return;
             }
-            if (headers) {
-                for (const [key, value] of Object.entries(headers)) {
-                    res.setHeader(key, value);
-                }
-            }
-            res.setHeader('Content-Type', 'application/json');
-            res.writeHead(status || 200);
-            res.end(JSON.stringify(response));
-        }).listen(port);
-    }
-}
-exports.default = HttpTrigger;
-function handleJson(data, unsafe) {
-    return new Promise((resolve, reject) => {
-        let body = '';
-        unsafe.req.on('data', chunk => {
-            body += chunk.toString();
-        });
-        unsafe.req.on('end', () => {
-            try {
-                resolve({
-                    ...data,
-                    body: body ? JSON.parse(body) : {}
-                });
-            }
-            catch (error) {
-                reject(error);
-            }
-        });
-    });
-}
-function handleUrlEncodedExtended(data, unsafe) {
-    return new Promise((resolve, reject) => {
-        let body = '';
-        unsafe.req.on('data', chunk => {
-            body += chunk.toString();
-        });
-        unsafe.req.on('end', () => {
-            try {
-                resolve({
-                    ...data,
-                    body: body ? qs_1.default.parse(body) : {}
-                });
-            }
-            catch (error) {
-                reject(error);
-            }
-        });
-    });
-}
-class HttpError extends Error {
-    status;
-    description;
-    constructor(status, description) {
-        super(description);
-        this.status = status;
-        this.description = description;
-        if (!description) {
-            this.description = http_1.default.STATUS_CODES[status];
         }
+        for (const handler of this.handlers) {
+            if (await handler(req, res))
+                return;
+        }
+        const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+        const isApi = url.pathname === this.apiPrefix || url.pathname.startsWith(this.apiPrefix + '/');
+        const isRead = req.method === 'GET' || req.method === 'HEAD';
+        if (this.staticPath && isRead && !isApi) {
+            if (await (0, static_1.serveStatic)(this.staticPath, url.pathname, req, res))
+                return;
+        }
+        const match = this.router.match(req.method || 'GET', url.pathname);
+        if (!match) {
+            if (this.staticPath && isRead && !isApi) {
+                if (await (0, static_1.serveStatic)(this.staticPath, '/index.html', req, res))
+                    return;
+            }
+            await this.runFlow(this.notFoundFlow, {}, url, req, res);
+            return;
+        }
+        await this.runFlow(match.flowName, match.params, url, req, res);
+    }
+    async runFlow(flowName, params, url, req, res) {
+        const query = Object.fromEntries(url.searchParams);
+        const result = await this.flows
+            .execute(flowName, { params, query, headers: req.headers }, { ...this.unsafe, req, res })
+            .catch((err) => this.resultFromError(err));
+        this.send(res, result || {});
+    }
+    resultFromError(err) {
+        log(err);
+        if (err instanceof errors_1.HttpError || (typeof err === 'object' && err !== null && 'status' in err)) {
+            const e = err;
+            return { status: e.status || 500, response: e.response ?? (e.description || 'Internal server error'), headers: e.headers };
+        }
+        return { status: 500, response: 'Internal server error' };
+    }
+    send(res, result) {
+        const { status, response, redirect, headers, httpSent } = result;
+        if (httpSent)
+            return;
+        if (headers)
+            for (const [k, v] of Object.entries(headers))
+                res.setHeader(k, v);
+        if (redirect) {
+            res.writeHead(302, { Location: redirect });
+            res.end();
+            return;
+        }
+        const r = response;
+        if (r && typeof r === 'object' && r.type === 'Buffer' && Array.isArray(r.data)) {
+            res.writeHead(status || 200);
+            res.end(Buffer.from(r.data));
+            return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(status || 200);
+        res.end(JSON.stringify(response ?? null));
+    }
+    listen(port, callback) {
+        this.server = http_1.default.createServer((req, res) => {
+            this.handle(req, res).catch((err) => {
+                log('unhandled', err);
+                if (!res.headersSent) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                }
+                res.end(JSON.stringify('Internal server error'));
+            });
+        });
+        return this.server.listen(port, callback);
+    }
+    close() {
+        return new Promise((resolve, reject) => {
+            if (!this.server || !this.server.listening)
+                return resolve();
+            this.server.close((err) => (err ? reject(err) : resolve()));
+        });
     }
 }
-exports.HttpError = HttpError;
+exports.HttpTrigger = HttpTrigger;
+exports.default = HttpTrigger;
 //# sourceMappingURL=index.js.map
